@@ -1,7 +1,8 @@
-#tfilewic 2025-09-07
+#tfilewic 2025-09-09
 
 import sys
 import pandas as pd
+import numpy as np
 
 CGM1_PATH = "CGMData.csv"
 CGM2_PATH = "CGM_patient2.csv"
@@ -9,6 +10,7 @@ INSULIN1_PATH = "InsulinData.csv"
 INSULIN2_PATH = "Insulin_patient2.csv"
 
 INSULIN_FEATURES = ["Timestamp", "BWZ Carb Input (grams)"]
+CGM_FEATURES = ["Timestamp", "Sensor Glucose (mg/dL)"]
 
 def import_file(filename:str) -> pd.DataFrame:
     """
@@ -55,30 +57,108 @@ def get_meals(df: pd.DataFrame) -> pd.DataFrame:
     #drop carb input column
     meals.drop(columns=["BWZ Carb Input (grams)"], inplace=True)
 
+    #fix index
+    meals.reset_index(drop=True, inplace=True)
+
     return meals
 
-def get_postabsorptive(df: pd.DataFrame) -> pd.DataFrame:
+def get_nomeals(df: pd.DataFrame) -> pd.DataFrame:
     """
     calculates start times of eligible postabsorptive windows
     """
+    meals = df.copy()
 
-    #drop meals which are followed by another meal within 4 hours
-    interrupted = (df["Timestamp"].shift(1) - df["Timestamp"] <= pd.Timedelta("4h"))
-    meals = df.drop(df.index[interrupted])
+    #drop NaNs
+    meals.dropna(subset=["BWZ Carb Input (grams)"], inplace=True)
 
-    #calculate start time of absorptive window from meal timestamp
-    postabsorptive = meals["Timestamp"] + pd.Timedelta("2h") 
+    #drop 0s
+    meals.drop(meals[meals["BWZ Carb Input (grams)"] == 0].index, inplace=True)
 
-    return postabsorptive
+    nomeals = []
+    for this_meal, next_meal in zip(meals["Timestamp"], meals["Timestamp"].shift(1)):
+        
+        #skip first row edge case
+        if pd.isna(next): 
+            continue
+            
+        start = this_meal + pd.Timedelta("2h")
+        end = next_meal - pd.Timedelta("2h")
 
-'''
-Extraction: Meal data
-The start of a meal can be obtained from InsulinData.csv. 
-Search column Y for a non-NAN non-zero value. This time indicates the start of a meal. There can be three conditions:
-    1. There is no meal from time tm to time tm+2hrs. Then use this stretch as meal data.
-    2. There is a meal at some time tp in between tp>tm and tp< tm+2hrs. Ignore the meal data at time tm and consider the meal at time tp instead.
-    3. There is a meal at time tm+2hrs, then consider the stretch from tm+1hr 30min to tm+4hrs as meal data.
-'''
+        while (start < end):
+            nomeals.append(start)
+            start += pd.Timedelta("2h")
+
+    return pd.DataFrame({"Timestamp": nomeals})
+
+
+def build_meal_matrix(meals: pd.DataFrame, cgm: pd.DataFrame) -> pd.DataFrame:
+    """
+    builds 30 sample absorptive windows from meal times 
+    """
+    THRESHOLD = 2
+    matrix = []
+
+    for meal in meals["Timestamp"]:
+        window = cgm[(cgm["Timestamp"] >= meal - pd.Timedelta("30min")) &
+                     (cgm["Timestamp"] <= meal + pd.Timedelta("2h"))]
+
+        values = window["Sensor Glucose (mg/dL)"].to_numpy()
+
+        #skip windows that dont have 30 pts
+        if len(values) != 30:
+            continue
+        
+        #discard if missing data points exceed threshold
+        missing = np.isnan(values).sum()
+        if missing > THRESHOLD:
+            continue
+        
+        #fill missing
+        if missing > 0:
+            series = pd.Series(values)
+            values = series.interpolate(limit_direction="both").to_numpy()
+
+        #insert row
+        matrix.append(values)
+
+    return pd.DataFrame(matrix)
+
+def build_nomeal_matrix(nomeals: pd.DataFrame, cgm: pd.DataFrame) -> pd.DataFrame:
+    """
+    builds 24 sample postabsorptive windows from nomeal times 
+    """
+    THRESHOLD = 2
+    matrix = []
+
+    for nomeal in nomeals["Timestamp"]:
+        window = cgm[(cgm["Timestamp"] >= nomeal) &
+                     (cgm["Timestamp"] <= nomeal + pd.Timedelta("2h"))]
+
+        values = window["Sensor Glucose (mg/dL)"].to_numpy()
+
+        #skip windows that dont have 24 pts
+        if len(values) != 24:
+            continue
+        
+        #discard if missing data points exceed threshold
+        missing = np.isnan(values).sum()
+        if missing > THRESHOLD:
+            continue
+        
+        #fill missing
+        if missing > 0:
+            series = pd.Series(values)
+            values = series.interpolate(limit_direction="both").to_numpy()
+
+        #insert row
+        matrix.append(values)
+
+    return pd.DataFrame(matrix)
+
+
+
+''' PREPROCESSING '''
+
 #import insulin data
 insulin1 = import_file(INSULIN1_PATH)
 insulin2 = import_file(INSULIN2_PATH)
@@ -91,52 +171,22 @@ create_timestamps(insulin2)
 create_timestamps(cgm1)
 create_timestamps(cgm2)
 
-#discard all but timestamps and col Y "BWZ Carb Input (grams)"
+#discard unused columns
 select_features(INSULIN_FEATURES, insulin1)
 select_features(INSULIN_FEATURES, insulin2)
+select_features(CGM_FEATURES, cgm1)
+select_features(CGM_FEATURES, cgm2)
 
-#filter meal start times
+#calculate window start times
 meals1 = get_meals(insulin1)
 meals2 = get_meals(insulin2)
+nomeals1 = get_nomeals(insulin1)
+nomeals2 = get_nomeals(insulin2)
 
-#calculate no-meal start times
-postabsorptive1 = get_postabsorptive(meals1)
-postabsorptive2 = get_postabsorptive(meals2)
+#create matrices
+meal_matrix = pd.concat([build_meal_matrix(meals1, cgm1), build_meal_matrix(meals2, cgm2)], ignore_index=True)
+nomeal_matrix = pd.concat([build_nomeal_matrix(meals1, cgm1), build_nomeal_matrix(meals2, cgm2)], ignore_index=True)
 
 
-
-
-
+''' FEATURE EXTRACTION '''
  
-#debug
-print(meals1)
-print(postabsorptive1)
-meals1.to_csv("mmmmmm.csv")
-postabsorptive1.to_csv("ppppppp.csv")
-
-
-'''
-Extraction: No Meal data 
-The start of no meal is at time tm+2hrs where tm is the start of some meal. 
-We need to obtain a 2hr stretch of no meal time. 
-So you need to find all 2 hr stretches in a day that have no meal and do not fall within 2 hrs of the start of a meal.
-'''
-
-
-
-'''
-Handling missing data: 
-You have to carefully handle missing data. This is an important data mining step that is required for many applications. 
-Here there are several approaches: 
-    1. Ignore the meal or no meal data stretch if the number of missing data points in that stretch is greater than a certain threshold.
-    2. Use linear interpolation (not a good idea for meal data but maybe for no meal data).
-    3. Use polynomial regression to fill up missing data (untested in this domain). 
-Choose wisely.
-'''
-
-
-
-'''
-Feature Extraction and Selection: 
-You have to carefully select features from the meal time series that are discriminatory between meal and no meal classes.
-'''
