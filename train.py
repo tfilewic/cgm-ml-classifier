@@ -12,6 +12,10 @@ INSULIN2_PATH = "Insulin_patient2.csv"
 INSULIN_FEATURES = ["Timestamp", "BWZ Carb Input (grams)"]
 CGM_FEATURES = ["Timestamp", "Sensor Glucose (mg/dL)"]
 
+EXTRACTED_FEATURES =  ["ttp", "normalized_difference", "fft", "range", "slope", "mean_d1", "max_d1", "mean_d2", "max_d2", "max_d1_3"]
+
+
+
 def import_file(filename:str) -> pd.DataFrame:
     """
     reads csv into dataframe
@@ -91,7 +95,7 @@ def get_nomeals(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame({"Timestamp": nomeals})
 
 
-def build_meal_matrix(meals: pd.DataFrame, cgm: pd.DataFrame) -> pd.DataFrame:
+def build_meal_matrix(meals: pd.DataFrame, cgm: pd.DataFrame) -> np.array:
     """
     builds 30 sample absorptive windows from meal times 
     """
@@ -121,9 +125,9 @@ def build_meal_matrix(meals: pd.DataFrame, cgm: pd.DataFrame) -> pd.DataFrame:
         #insert row
         matrix.append(values)
 
-    return pd.DataFrame(matrix)
+    return np.array(matrix, dtype=float)
 
-def build_nomeal_matrix(nomeals: pd.DataFrame, cgm: pd.DataFrame) -> pd.DataFrame:
+def build_nomeal_matrix(nomeals: pd.DataFrame, cgm: pd.DataFrame) -> np.array:
     """
     builds 24 sample postabsorptive windows from nomeal times 
     """
@@ -153,8 +157,43 @@ def build_nomeal_matrix(nomeals: pd.DataFrame, cgm: pd.DataFrame) -> pd.DataFram
         #insert row
         matrix.append(values)
 
-    return pd.DataFrame(matrix)
+    return np.array(matrix, dtype=float)
 
+def create_feature_row(glucose: np.ndarray) -> np.ndarray:
+    """
+    creates a row of features from a period of glucose readings
+    """
+    n = len(glucose)
+    time = np.arange(n)
+    minimum = float(glucose.min())
+    maximum = float(glucose.max())
+
+    fft_vals = np.fft.fft(glucose)
+    power = np.abs(fft_vals) ** 2
+
+    d1 = np.diff(glucose)
+    d2 = np.diff(d1)
+    d1_3 = glucose[2:] - glucose[:-2] #across 3 data points
+
+    ttp = np.argmax(glucose) / n
+    normalized_difference = (maximum - minimum) / minimum
+    fft = power[1]
+    range = maximum - minimum
+    slope = np.polyfit(time, glucose, 1)[0]
+    mean_d1 = d1.mean()
+    max_d1 = np.max(np.abs(d1))
+    mean_d2 = d2.mean()
+    max_d2 = np.max(np.abs(d2))
+    max_d1_3 = np.max(np.abs(d1_3))
+
+    return np.array([ttp, normalized_difference, fft, range, slope, mean_d1, max_d1, mean_d2, max_d2, max_d1_3], dtype=float)
+
+def extract_features(matrix: np.ndarray) -> np.ndarray:
+    """
+    extracts features from each row in a meal or nomeal matrix
+    """
+    features = [create_feature_row(row) for row in matrix]
+    return np.vstack(features)
 
 
 ''' PREPROCESSING '''
@@ -184,9 +223,14 @@ nomeals1 = get_nomeals(insulin1)
 nomeals2 = get_nomeals(insulin2)
 
 #create matrices
-meal_matrix = pd.concat([build_meal_matrix(meals1, cgm1), build_meal_matrix(meals2, cgm2)], ignore_index=True)
-nomeal_matrix = pd.concat([build_nomeal_matrix(meals1, cgm1), build_nomeal_matrix(meals2, cgm2)], ignore_index=True)
+meal_matrix = np.vstack([build_meal_matrix(meals1, cgm1), build_meal_matrix(meals2, cgm2)])
+nomeal_matrix = np.vstack([build_nomeal_matrix(meals1, cgm1), build_nomeal_matrix(meals2, cgm2)])
 
 
 ''' FEATURE EXTRACTION '''
- 
+meal_features = extract_features(meal_matrix)
+nomeal_features = extract_features(nomeal_matrix)
+
+print(meal_features)
+print(nomeal_features)
+
