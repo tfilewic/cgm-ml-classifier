@@ -1,19 +1,23 @@
-#tfilewic 2025-09-09
+#tfilewic 2025-09-10
 
 import sys
 import pandas as pd
 import numpy as np
+from sklearn.svm import SVC
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+import pickle
 
 CGM1_PATH = "CGMData.csv"
 CGM2_PATH = "CGM_patient2.csv"
 INSULIN1_PATH = "InsulinData.csv"
 INSULIN2_PATH = "Insulin_patient2.csv"
+MODEL_PATH = "model.pkl"
 
 INSULIN_FEATURES = ["Timestamp", "BWZ Carb Input (grams)"]
 CGM_FEATURES = ["Timestamp", "Sensor Glucose (mg/dL)"]
-
-EXTRACTED_FEATURES =  ["ttp", "normalized_difference", "fft", "range", "slope", "mean_d1", "max_d1", "mean_d2", "max_d2", "max_d1_3"]
-
+EXTRACTED_FEATURES = ["ttp", "normalized_difference", "fft", "range", "max_d1_3", "max_d2", "quarter_slope"]
 
 
 def import_file(filename:str) -> pd.DataFrame:
@@ -82,7 +86,7 @@ def get_nomeals(df: pd.DataFrame) -> pd.DataFrame:
     for this_meal, next_meal in zip(meals["Timestamp"], meals["Timestamp"].shift(1)):
         
         #skip first row edge case
-        if pd.isna(next): 
+        if pd.isna(next_meal): 
             continue
             
         start = this_meal + pd.Timedelta("2h")
@@ -164,29 +168,35 @@ def create_feature_row(glucose: np.ndarray) -> np.ndarray:
     creates a row of features from a period of glucose readings
     """
     n = len(glucose)
-    time = np.arange(n)
     minimum = float(glucose.min())
     maximum = float(glucose.max())
 
-    fft_vals = np.fft.fft(glucose)
-    power = np.abs(fft_vals) ** 2
+    quarter = n // 4
+    quarter_slope = (glucose[quarter+1] - glucose[quarter-1]) / 2.0
 
-    d1 = np.diff(glucose)
-    d2 = np.diff(d1)
-    d1_3 = glucose[2:] - glucose[:-2] #across 3 data points
+    smoothed3 = np.convolve(glucose, np.array([1,1,1])/3.0, mode="same")
+    start = n // 5  #ignore first 20%
+    end = n - 2     #ignore trailing edge
+    peak_index = start + int(np.argmax(smoothed3[start:end]))
+    ttp = peak_index / (n - 1)
 
-    ttp = np.argmax(glucose) / n
     normalized_difference = (maximum - minimum) / minimum
-    fft = power[1]
     range = maximum - minimum
-    slope = np.polyfit(time, glucose, 1)[0]
-    mean_d1 = d1.mean()
-    max_d1 = np.max(np.abs(d1))
-    mean_d2 = d2.mean()
-    max_d2 = np.max(np.abs(d2))
+    
+    d1_3 = glucose[2:] - glucose[:-2]  #across 3pts
     max_d1_3 = np.max(np.abs(d1_3))
 
-    return np.array([ttp, normalized_difference, fft, range, slope, mean_d1, max_d1, mean_d2, max_d2, max_d1_3], dtype=float)
+    d2 = np.diff(np.diff(glucose))
+    max_d2 = np.max(np.abs(d2))
+    
+    fft_vals = np.fft.fft(glucose)
+    power = np.abs(fft_vals) ** 2
+    fft = power[1]
+
+    return np.array(
+        [ttp, normalized_difference, fft, range, max_d1_3, max_d2, quarter_slope],
+        dtype=float
+    )
 
 def extract_features(matrix: np.ndarray) -> np.ndarray:
     """
@@ -196,8 +206,8 @@ def extract_features(matrix: np.ndarray) -> np.ndarray:
     return np.vstack(features)
 
 
-''' PREPROCESSING '''
 
+''' PREPROCESSING '''
 #import insulin data
 insulin1 = import_file(INSULIN1_PATH)
 insulin2 = import_file(INSULIN2_PATH)
@@ -224,13 +234,22 @@ nomeals2 = get_nomeals(insulin2)
 
 #create matrices
 meal_matrix = np.vstack([build_meal_matrix(meals1, cgm1), build_meal_matrix(meals2, cgm2)])
-nomeal_matrix = np.vstack([build_nomeal_matrix(meals1, cgm1), build_nomeal_matrix(meals2, cgm2)])
+nomeal_matrix = np.vstack([build_nomeal_matrix(nomeals1, cgm1), build_nomeal_matrix(nomeals2, cgm2)])
 
 
 ''' FEATURE EXTRACTION '''
 meal_features = extract_features(meal_matrix)
 nomeal_features = extract_features(nomeal_matrix)
 
-print(meal_features)
-print(nomeal_features)
+
+''' TRAIN MODEL '''
+X = np.vstack([meal_features, nomeal_features])
+y = np.hstack([np.ones(len(meal_features)), np.zeros(len(nomeal_features))])
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+clf = make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.0, gamma="scale", class_weight="balanced"))
+clf.fit(X, y)
+
+with open(MODEL_PATH, "wb") as output_file:
+    pickle.dump(clf, output_file)
 
